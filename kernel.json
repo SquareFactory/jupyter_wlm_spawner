@@ -1,6 +1,12 @@
-{"argv":
-    [
-        "python", "-m", "jupyter_wlm_spawner", "-f", "{connection_file}", "-o '-N 1'", "-e 'module load spark'"
-    ],
- "display_name": "WLM Spawner"
+{
+  "argv": [
+    "python",
+    "-m",
+    "jupyter_wlm_spawner",
+    "-f",
+    "{connection_file}",
+    "-o '-N 1'",
+    "-e 'module load spark'"
+  ],
+  "display_name": "WLM Spawner"
 }

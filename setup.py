@@ -1,20 +1,20 @@
 import setuptools
 
-with open("README.md", "r") as fh:
+with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setuptools.setup(
     name="jupyter-wlm-spawner",
-    version="0.0.1a0",
+    version="0.0.2",
     author="Dmitry Chirikov",
     author_email="dmitry@chirikov.nl",
     description="",
     long_description=long_description,
     long_description_content_type="text/markdown",
     install_requires=[
-        'jupyter-client>=5.2,<5.3',
+        "jupyter-client>=7.3,<8.0",
     ],
-    url="https://github.com/dchirikov/wlm_spawner",
+    url="https://github.com/SquareFactory/jupyter_wlm_spawner",
     packages=setuptools.find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",

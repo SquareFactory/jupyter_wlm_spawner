@@ -234,7 +234,6 @@ class WLMSpawner:
             )
 
     def get_real_kernel_cmd(self):
-        connection_file = self.args.connection_file
         ret = " ".join(self.kernel_spec.argv)
         return eval(f'f"""{ret}"""')
 

@@ -5,6 +5,7 @@ name = "pypi"
 
 [packages]
 jupyter-client = "*"
+pycryptodome = "*"
 
 [dev-packages]
 black = "*"

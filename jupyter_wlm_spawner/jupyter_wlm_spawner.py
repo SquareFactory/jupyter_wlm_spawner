@@ -1,8 +1,11 @@
 import argparse
 import atexit
 import json
+import os
 import subprocess
+import logging
 from threading import Timer
+from Crypto.PublicKey import ECC
 
 from jupyter_client.kernelspec import KernelSpecManager
 
@@ -18,6 +21,7 @@ def run_cmd(
     """
     return_code = 255
     stdout, stderr, exception = None, None, None
+    logging.debug(f"Calling: {cmd}")
     try:
         proc = subprocess.Popen(
             cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -45,6 +49,7 @@ class WLMSpawnerError(RuntimeError):
 class WLMSpawner:
     def __init__(self):
         self.args = self.parse_arguments()
+        self.initialize_keys()
         self.connection = self.parse_connection_file(self.args.connection_file)
         self.spawn = eval(f"self._spawn_{self.args.scheduler}")
         self.kernel_spec = KernelSpecManager().get_kernel_spec(
@@ -53,7 +58,19 @@ class WLMSpawner:
 
     def parse_arguments(self):
         """Parse program arguments"""
-        parser = argparse.ArgumentParser(description="WLM spawner")
+        user = os.environ.get("USER")
+        if user is None:
+            raise WLMSpawnerError("$USER is none")
+
+        home = os.environ.get("HOME")
+        if home is None:
+            raise WLMSpawnerError("$HOME is none")
+
+        private_key_path = f"{home}/.ssh/{user}_jupslurm"
+        parser = argparse.ArgumentParser(
+            description="WLM spawner",
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        )
         parser.add_argument(
             "-f", "--connection-file", help="Connection file", required=True
         )
@@ -94,6 +111,11 @@ class WLMSpawner:
             "-k", "--kernel", default="python3", help="Kernel to spawn"
         )
         parser.add_argument(
+            "--keyfile",
+            default=private_key_path,
+            help="SSH private key file",
+        )
+        parser.add_argument(
             "-e", "--env-commands", default="", help="Kernel to spawn"
         )
 
@@ -113,7 +135,7 @@ class WLMSpawner:
             f"{self.args.scontrol} show job {jobid}"
         )
         if exception is not None:
-            print(exception)
+            logging.warning(exception)
 
         if return_code:
             raise WLMSpawnerError(
@@ -186,6 +208,8 @@ class WLMSpawner:
         # Forward ports
         ssh_forwarding = [
             "ssh",
+            "-i",
+            self.args.keyfile,
             "-L",
             f"{self.connection['shell_port']}:localhost:{self.connection['shell_port']}",
             "-L",
@@ -200,6 +224,8 @@ class WLMSpawner:
             batch_host,
         ]
 
+        logging.debug(f"Calling: {ssh_forwarding}")
+
         ssh_proc = subprocess.Popen(
             ssh_forwarding,
             stdout=subprocess.PIPE,
@@ -213,30 +239,33 @@ class WLMSpawner:
         dest_dir = "/".join(self.args.connection_file.split("/")[:-1])
 
         # create dir to store connection file
-        ssh_mkdir = f"ssh {batch_host} mkdir -p {dest_dir}"
-        return_code, _, stderr, exception = run_cmd(ssh_mkdir)
+        return_code, _, stderr, exception = run_cmd(
+            f"ssh -i {self.args.keyfile} {batch_host} mkdir -p {dest_dir}"
+        )
         if exception is not None:
-            print(exception)
+            logging.warning(exception)
         if return_code:
             raise WLMSpawnerError(
                 f"Unable to create dir to store connection_file: stderr: {stderr}"
             )
 
         # chmod
-        ssh_chmod = f"ssh {batch_host} chmod 1700 {dest_dir}"
-        return_code, _, stderr, exception = run_cmd(ssh_chmod)
+        return_code, _, stderr, exception = run_cmd(
+            f"ssh -i {self.args.keyfile} {batch_host} chmod 1700 {dest_dir}"
+        )
         if exception is not None:
-            print(exception)
+            logging.warning(exception)
         if return_code:
             raise WLMSpawnerError(
                 f"Unable to chmod on dir to store connection_file: stderr: {stderr}"
             )
 
         # copy connection file
-        scp_cmd = f"scp -pr {self.args.connection_file} {batch_host}:{self.args.connection_file}"
-        return_code, _, stderr, exception = run_cmd(scp_cmd)
+        return_code, _, stderr, exception = run_cmd(
+            f"scp -i {self.args.keyfile} -pr {self.args.connection_file} {batch_host}:{self.args.connection_file}"
+        )
         if exception is not None:
-            print(exception)
+            logging.warning(exception)
         if return_code:
             raise WLMSpawnerError(
                 f"Unable to scp connection_file: stderr: {stderr}"
@@ -255,16 +284,48 @@ class WLMSpawner:
         salloc_proc.wait()
 
         # Cleanup. Delete unnneded connection file
-        ssh_delete_conn_file = (
-            f"ssh {batch_host} rm -f {self.args.connection_file}"
+        return_code, _, stderr, exception = run_cmd(
+            f"ssh -i {self.args.keyfile} {batch_host} rm -f {self.args.connection_file}"
         )
-        return_code, _, stderr, exception = run_cmd(ssh_delete_conn_file)
         if exception is not None:
-            print(exception)
+            logging.warning(exception)
         if return_code:
             raise WLMSpawnerError(
                 f"Unable to delete connection file: stderr: {stderr}"
             )
+
+    def initialize_keys(self):
+        """Generate and use SSH keys"""
+        if not os.path.exists(self.args.keyfile):
+            logging.warning(
+                f"keyfile doesn't exists. Generating {self.args.keyfile}"
+            )
+            user = os.environ.get("USER")
+            if user is None:
+                raise WLMSpawnerError("$USER is none")
+
+            home = os.environ.get("HOME")
+            if home is None:
+                raise WLMSpawnerError("$HOME is none")
+
+            private_key_path = f"{home}/.ssh/{user}_jupslurm"
+            public_key_path = f"{private_key_path}.pub"
+
+            private_key = ECC.generate(curve="ed25519")
+            with open(private_key_path, "w", encoding="utf-8") as pk_file:
+                os.chmod(private_key_path, 0o600)
+                pk_file.write(str(private_key.export_key(format="PEM")))
+
+            public_key = private_key.public_key().export_key(format="OpenSSH")
+            with open(public_key_path, "w", encoding="utf-8") as pub_file:
+                os.chmod(public_key_path, 0o600)
+                pub_file.write(str(public_key))
+
+            with open(
+                f"{home}/.ssh/authorized_keys", "a", encoding="utf-8"
+            ) as authorized_keys:
+                os.chmod(f"{home}/.ssh/authorized_keys", 0o600)
+                authorized_keys.write(str(public_key))
 
     def get_real_kernel_cmd(self):
         ret = " ".join(self.kernel_spec.argv)

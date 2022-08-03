@@ -75,23 +75,18 @@ class WLMSpawner:
             "-f", "--connection-file", help="Connection file", required=True
         )
         parser.add_argument(
-            "--sbatch",
-            help="sbatch path",
-            default="sbatch",
-        )
-        parser.add_argument(
             "--srun",
-            help="sbatch path",
+            help="remote srun executable (accepts arguments)",
             default="srun",
         )
         parser.add_argument(
             "--scancel",
-            help="scancel path",
+            help="scancel executable (accepts arguments)",
             default="scancel",
         )
         parser.add_argument(
             "--scontrol",
-            help="scontrol path",
+            help="scontrol executable (accepts arguments)",
             default="scontrol",
         )
         parser.add_argument(
@@ -158,7 +153,7 @@ class WLMSpawner:
     def _spawn_slurm(self):
         # With -I don't wait inifinite time for allocation
         salloc_cmd = [
-            self.args.salloc,
+            *self.args.salloc.split(),
             f"-I{DEFAULT_CMD_TIMEOUT}",
             *self.args.wlm_options.split(),
         ]
@@ -189,7 +184,7 @@ class WLMSpawner:
         # delete job on exit
         atexit.register(
             subprocess.Popen,
-            [self.args.scancel, str(jobid)],
+            [*self.args.scancel.split(), str(jobid)],
             shell=False,
         )
 
@@ -300,27 +295,25 @@ class WLMSpawner:
             logging.warning(
                 f"keyfile doesn't exists. Generating {self.args.keyfile}"
             )
-            user = os.environ.get("USER")
-            if user is None:
-                raise WLMSpawnerError("$USER is none")
 
-            home = os.environ.get("HOME")
-            if home is None:
-                raise WLMSpawnerError("$HOME is none")
-
-            private_key_path = f"{home}/.ssh/{user}_jupslurm"
-            public_key_path = f"{private_key_path}.pub"
-
+            # Generate and write private key
+            private_key_path = self.args.keyfile
             private_key = ECC.generate(curve="ed25519")
             with open(private_key_path, "w", encoding="utf-8") as pk_file:
                 os.chmod(private_key_path, 0o600)
                 pk_file.write(str(private_key.export_key(format="PEM")))
 
+            # Generate and write public key
+            public_key_path = f"{private_key_path}.pub"
             public_key = private_key.public_key().export_key(format="OpenSSH")
             with open(public_key_path, "w", encoding="utf-8") as pub_file:
                 os.chmod(public_key_path, 0o600)
                 pub_file.write(str(public_key))
 
+            # Add public key to authorized_keys
+            home = os.environ.get("HOME")
+            if not os.path.exists(f"{home}/.ssh"):
+                os.makedirs(f"{home}/.ssh", mode=0o700)
             with open(
                 f"{home}/.ssh/authorized_keys", "a", encoding="utf-8"
             ) as authorized_keys:

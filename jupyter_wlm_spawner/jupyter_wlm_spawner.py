@@ -1,133 +1,111 @@
 import argparse
 import atexit
-import json
+import logging
 import os
 import subprocess
-import logging
-from threading import Timer
-from Crypto.PublicKey import ECC
+from typing import Any
 
+from Crypto.PublicKey import ECC
 from jupyter_client.kernelspec import KernelSpecManager
 
-DEFAULT_CMD_TIMEOUT = 30  # sec
+from jupyter_wlm_spawner.errors import WLMSpawnerError
+from jupyter_wlm_spawner.utils import (
+    get_real_kernel_cmd,
+    parse_connection_file,
+    run_cmd,
+)
+
+logging.basicConfig(level=logging.DEBUG)
+
+DEFAULT_SALLOC_TIMEOUT = 30  # sec
+
+SSH_COMMAND = "ssh"
+SCP_COMMAND = "scp"
+SSH_ARGS = '-o "StrictHostKeyChecking=no" -o "UserKnownHostsFile=/dev/null"'
 
 
-def run_cmd(
-    cmd: str, timeout=DEFAULT_CMD_TIMEOUT
-) -> tuple[int, bytes | None, bytes | None, Exception | None]:
-    """
-    Returns 'rc', 'stdout', 'stderr', 'exception'.
-    Where 'exception' is a content of Python exception if any.
-    """
-    return_code = 255
-    stdout, stderr, exception = None, None, None
-    logging.debug(f"Calling: {cmd}")
-    try:
-        proc = subprocess.Popen(
-            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        timer = Timer(timeout, lambda p: p.kill(), [proc])
-        try:
-            timer.start()
-            stdout, stderr = proc.communicate()
-        except:
-            exception = Exception(f"Timeout executing '{cmd}'")
-        finally:
-            timer.cancel()
+def parse_arguments():
+    """Parse program arguments"""
+    user = os.environ.get("USER")
+    if user is None:
+        raise WLMSpawnerError("$USER is none")
 
-        proc.wait()
-        return_code = int(proc.returncode)
-    except Exception as e:
-        exception = e
-    return return_code, stdout, stderr, exception
+    home = os.environ.get("HOME")
+    if home is None:
+        raise WLMSpawnerError("$HOME is none")
+
+    private_key_path = f"{home}/.ssh/{user}_jupslurm"
+    parser = argparse.ArgumentParser(
+        description="WLM spawner",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "-f", "--connection-file", help="Connection file", required=True
+    )
+    parser.add_argument(
+        "--srun",
+        help="remote srun executable (accepts arguments)",
+        default="srun",
+    )
+    parser.add_argument(
+        "--scancel",
+        help="scancel executable (accepts arguments)",
+        default="scancel",
+    )
+    parser.add_argument(
+        "--scontrol",
+        help="scontrol executable (accepts arguments)",
+        default="scontrol",
+    )
+    parser.add_argument(
+        "-s",
+        "--scheduler",
+        choices=["slurm"],
+        default="slurm",
+        help="Scheduler type",
+    )
+    parser.add_argument(
+        "-o",
+        "--wlm-options",
+        default="",
+        help="Additional options for workload manager",
+    )
+    parser.add_argument(
+        "-k", "--kernel", default="python3", help="Kernel to spawn"
+    )
+    parser.add_argument(
+        "--keyfile",
+        default=private_key_path,
+        help="SSH private key file",
+    )
+    parser.add_argument(
+        "-e", "--env-commands", default="", help="Kernel to spawn"
+    )
+
+    return parser.parse_args()
 
 
-class WLMSpawnerError(RuntimeError):
-    """Workload Manager Runtime Error."""
+global_args = parse_arguments()
 
 
 class WLMSpawner:
+    connection: Any
+    kernel_spec: Any
+
     def __init__(self):
-        self.args = self.parse_arguments()
         self.initialize_keys()
-        self.connection = self.parse_connection_file(self.args.connection_file)
-        self.spawn = eval(f"self._spawn_{self.args.scheduler}")
+        self.connection = parse_connection_file(global_args.connection_file)
         self.kernel_spec = KernelSpecManager().get_kernel_spec(
-            self.args.kernel
+            global_args.kernel
         )
-
-    def parse_arguments(self):
-        """Parse program arguments"""
-        user = os.environ.get("USER")
-        if user is None:
-            raise WLMSpawnerError("$USER is none")
-
-        home = os.environ.get("HOME")
-        if home is None:
-            raise WLMSpawnerError("$HOME is none")
-
-        private_key_path = f"{home}/.ssh/{user}_jupslurm"
-        parser = argparse.ArgumentParser(
-            description="WLM spawner",
-            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        )
-        parser.add_argument(
-            "-f", "--connection-file", help="Connection file", required=True
-        )
-        parser.add_argument(
-            "--srun",
-            help="remote srun executable (accepts arguments)",
-            default="srun",
-        )
-        parser.add_argument(
-            "--scancel",
-            help="scancel executable (accepts arguments)",
-            default="scancel",
-        )
-        parser.add_argument(
-            "--scontrol",
-            help="scontrol executable (accepts arguments)",
-            default="scontrol",
-        )
-        parser.add_argument(
-            "-s",
-            "--scheduler",
-            choices=["slurm", "sge"],
-            default="slurm",
-            help="Scheduler type",
-        )
-        parser.add_argument(
-            "-o",
-            "--wlm-options",
-            default="",
-            help="Additional options for workload manager",
-        )
-        parser.add_argument(
-            "-k", "--kernel", default="python3", help="Kernel to spawn"
-        )
-        parser.add_argument(
-            "--keyfile",
-            default=private_key_path,
-            help="SSH private key file",
-        )
-        parser.add_argument(
-            "-e", "--env-commands", default="", help="Kernel to spawn"
-        )
-
-        return parser.parse_args()
-
-    def parse_connection_file(self, connection_file):
-        """Parse a Jupyter connection file."""
-        with open(connection_file, encoding="utf-8") as f:
-            return json.load(f)
 
     def get_scontrol_job_field(self, jobid: int, field: str):
         """Fetch and parse slurm job info."""
         res = None
         field += "="
-        what_size = len(field)
+        field_size = len(field)
         return_code, stdout, stderr, exception = run_cmd(
-            f"{self.args.scontrol} show job {jobid}"
+            f"{global_args.scontrol} show job {jobid}"
         )
         if exception is not None:
             logging.warning(exception)
@@ -138,24 +116,51 @@ class WLMSpawner:
             )
         show_job = str(stdout).split()
         for rec in show_job:
-            if rec[:what_size] == field:
-                res = rec[what_size:]
+            if rec[:field_size] == field:
+                res = rec[field_size:]
         if res is None:
             raise WLMSpawnerError(
                 f"Unable to get job field {field} for job {jobid}"
             )
         return res
 
-    def _spawn_sge(self):
-        # TODO
-        raise NotImplementedError
+    def initialize_keys(self):
+        """Generate and use SSH keys"""
+        if not os.path.exists(global_args.keyfile):
+            logging.warning(
+                "keyfile doesn't exists. Generating %s", global_args.keyfile
+            )
 
-    def _spawn_slurm(self):
+            # Generate and write private key
+            private_key_path = global_args.keyfile
+            private_key = ECC.generate(curve="ed25519")
+            with open(private_key_path, "w", encoding="utf-8") as pk_file:
+                os.chmod(private_key_path, 0o600)
+                pk_file.write(str(private_key.export_key(format="PEM")))
+
+            # Generate and write public key
+            public_key_path = f"{private_key_path}.pub"
+            public_key = private_key.public_key().export_key(format="OpenSSH")
+            with open(public_key_path, "w", encoding="utf-8") as pub_file:
+                os.chmod(public_key_path, 0o600)
+                pub_file.write(str(public_key))
+
+            # Add public key to authorized_keys
+            home = os.environ.get("HOME")
+            if not os.path.exists(f"{home}/.ssh"):
+                os.makedirs(f"{home}/.ssh", mode=0o700)
+            with open(
+                f"{home}/.ssh/authorized_keys", "a", encoding="utf-8"
+            ) as authorized_keys:
+                os.chmod(f"{home}/.ssh/authorized_keys", 0o600)
+                authorized_keys.write(str(public_key))
+
+    def spawn_slurm(self):
         # With -I don't wait inifinite time for allocation
         salloc_cmd = [
-            *self.args.salloc.split(),
-            f"-I{DEFAULT_CMD_TIMEOUT}",
-            *self.args.wlm_options.split(),
+            *global_args.salloc.split(),
+            f"-I{DEFAULT_SALLOC_TIMEOUT}",
+            *global_args.wlm_options.split(),
         ]
 
         salloc_proc = subprocess.Popen(
@@ -184,7 +189,7 @@ class WLMSpawner:
         # delete job on exit
         atexit.register(
             subprocess.Popen,
-            [*self.args.scancel.split(), str(jobid)],
+            [*global_args.scancel.split(), str(jobid)],
             shell=False,
         )
 
@@ -202,9 +207,10 @@ class WLMSpawner:
 
         # Forward ports
         ssh_forwarding = [
-            "ssh",
+            SSH_COMMAND,
+            *SSH_ARGS.split(),
             "-i",
-            self.args.keyfile,
+            global_args.keyfile,
             "-L",
             f"{self.connection['shell_port']}:localhost:{self.connection['shell_port']}",
             "-L",
@@ -215,11 +221,11 @@ class WLMSpawner:
             f"{self.connection['control_port']}:localhost:{self.connection['control_port']}",
             "-L",
             f"{self.connection['hb_port']}:localhost:{self.connection['hb_port']}",
-            "-N",
+            "-fN",
             batch_host,
         ]
 
-        logging.debug(f"Calling: {ssh_forwarding}")
+        logging.debug("Calling: %s", ssh_forwarding)
 
         ssh_proc = subprocess.Popen(
             ssh_forwarding,
@@ -231,11 +237,11 @@ class WLMSpawner:
         atexit.register(ssh_proc.terminate)
 
         # Copy kernel file to host
-        dest_dir = "/".join(self.args.connection_file.split("/")[:-1])
+        dest_dir = "/".join(global_args.connection_file.split("/")[:-1])
 
         # create dir to store connection file
         return_code, _, stderr, exception = run_cmd(
-            f"ssh -i {self.args.keyfile} {batch_host} mkdir -p {dest_dir}"
+            f"{SSH_COMMAND} {SSH_ARGS} -i {global_args.keyfile} {batch_host} mkdir -p {dest_dir}"
         )
         if exception is not None:
             logging.warning(exception)
@@ -246,7 +252,7 @@ class WLMSpawner:
 
         # chmod
         return_code, _, stderr, exception = run_cmd(
-            f"ssh -i {self.args.keyfile} {batch_host} chmod 1700 {dest_dir}"
+            f"{SSH_COMMAND} {SSH_ARGS} -i {global_args.keyfile} {batch_host} chmod 1700 {dest_dir}"
         )
         if exception is not None:
             logging.warning(exception)
@@ -257,7 +263,7 @@ class WLMSpawner:
 
         # copy connection file
         return_code, _, stderr, exception = run_cmd(
-            f"scp -i {self.args.keyfile} -pr {self.args.connection_file} {batch_host}:{self.args.connection_file}"
+            f"{SCP_COMMAND} {SSH_ARGS} -i {global_args.keyfile} -pr {global_args.connection_file} {batch_host}:{global_args.connection_file}"
         )
         if exception is not None:
             logging.warning(exception)
@@ -267,20 +273,20 @@ class WLMSpawner:
             )
 
         # run real kernel
-        kernel_cmd = self.get_real_kernel_cmd()
-        env_commands = self.args.env_commands.strip()[1:-1]
+        kernel_cmd = get_real_kernel_cmd(self.kernel_spec.argv)
+        env_commands = global_args.env_commands.strip()[1:-1]
         kernel_script = "set -e"
         kernel_script = "set -x"
         kernel_script += f"{env_commands}\n"
         kernel_script += (
-            f"{self.args.srun} -N 1 -E -w {batch_host} {kernel_cmd}\n"
+            f"{global_args.srun} -N 1 -E -w {batch_host} {kernel_cmd}\n"
         )
         _ = salloc_proc.communicate(kernel_script)
         salloc_proc.wait()
 
         # Cleanup. Delete unnneded connection file
         return_code, _, stderr, exception = run_cmd(
-            f"ssh -i {self.args.keyfile} {batch_host} rm -f {self.args.connection_file}"
+            f'ssh -o "StrictHostKeyChecking=no" -o "UserKnownHostsFile=/dev/null" -i {global_args.keyfile} {batch_host} rm -f {global_args.connection_file}'
         )
         if exception is not None:
             logging.warning(exception)
@@ -289,43 +295,11 @@ class WLMSpawner:
                 f"Unable to delete connection file: stderr: {stderr}"
             )
 
-    def initialize_keys(self):
-        """Generate and use SSH keys"""
-        if not os.path.exists(self.args.keyfile):
-            logging.warning(
-                f"keyfile doesn't exists. Generating {self.args.keyfile}"
-            )
-
-            # Generate and write private key
-            private_key_path = self.args.keyfile
-            private_key = ECC.generate(curve="ed25519")
-            with open(private_key_path, "w", encoding="utf-8") as pk_file:
-                os.chmod(private_key_path, 0o600)
-                pk_file.write(str(private_key.export_key(format="PEM")))
-
-            # Generate and write public key
-            public_key_path = f"{private_key_path}.pub"
-            public_key = private_key.public_key().export_key(format="OpenSSH")
-            with open(public_key_path, "w", encoding="utf-8") as pub_file:
-                os.chmod(public_key_path, 0o600)
-                pub_file.write(str(public_key))
-
-            # Add public key to authorized_keys
-            home = os.environ.get("HOME")
-            if not os.path.exists(f"{home}/.ssh"):
-                os.makedirs(f"{home}/.ssh", mode=0o700)
-            with open(
-                f"{home}/.ssh/authorized_keys", "a", encoding="utf-8"
-            ) as authorized_keys:
-                os.chmod(f"{home}/.ssh/authorized_keys", 0o600)
-                authorized_keys.write(str(public_key))
-
-    def get_real_kernel_cmd(self):
-        ret = " ".join(self.kernel_spec.argv)
-        return eval(f'f"""{ret}"""')
-
 
 def main():
     """Main entrypoint."""
     wlm_spawner = WLMSpawner()
-    wlm_spawner.spawn()
+    if global_args.scheduler == "slurm":
+        wlm_spawner.spawn_slurm()
+    else:
+        raise WLMSpawnerError(f"Unhandled scheduler: {global_args.scheduler}")

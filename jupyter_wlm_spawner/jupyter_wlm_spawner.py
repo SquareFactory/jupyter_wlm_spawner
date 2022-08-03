@@ -13,8 +13,8 @@ def run_cmd(
     cmd: str, timeout=DEFAULT_CMD_TIMEOUT
 ) -> tuple[int, bytes | None, bytes | None, Exception | None]:
     """
-    Returns 'rc', 'stdout', 'stderr', 'exception'
-    Where 'exception' is a content of Python exception if any
+    Returns 'rc', 'stdout', 'stderr', 'exception'.
+    Where 'exception' is a content of Python exception if any.
     """
     return_code = 255
     stdout, stderr, exception = None, None, None
@@ -39,32 +39,7 @@ def run_cmd(
 
 
 class WLMSpawnerError(RuntimeError):
-    pass
-
-
-def get_scontrol_job_field(jobnum: int, what: str):
-    res = None
-    what += "="
-    what_size = len(what)
-    return_code, stdout, stderr, exception = run_cmd(
-        f"scontrol show job {jobnum}"
-    )
-    if exception is not None:
-        print(exception)
-
-    if return_code:
-        raise WLMSpawnerError(
-            f"Unable to get job status. Jobid: {jobnum}; stderr: {stderr}"
-        )
-    show_job = str(stdout).split()
-    for rec in show_job:
-        if rec[:what_size] == what:
-            res = rec[what_size:]
-    if res is None:
-        raise WLMSpawnerError(
-            f"Unable to get job field {what} for job {jobnum}"
-        )
-    return res
+    """Workload Manager Runtime Error."""
 
 
 class WLMSpawner:
@@ -77,9 +52,30 @@ class WLMSpawner:
         )
 
     def parse_arguments(self):
+        """Parse program arguments"""
         parser = argparse.ArgumentParser(description="WLM spawner")
         parser.add_argument(
             "-f", "--connection-file", help="Connection file", required=True
+        )
+        parser.add_argument(
+            "--sbatch",
+            help="sbatch path",
+            default="sbatch",
+        )
+        parser.add_argument(
+            "--srun",
+            help="sbatch path",
+            default="srun",
+        )
+        parser.add_argument(
+            "--scancel",
+            help="scancel path",
+            default="scancel",
+        )
+        parser.add_argument(
+            "--scontrol",
+            help="scontrol path",
+            default="scontrol",
         )
         parser.add_argument(
             "-s",
@@ -104,9 +100,34 @@ class WLMSpawner:
         return parser.parse_args()
 
     def parse_connection_file(self, connection_file):
+        """Parse a Jupyter connection file."""
         with open(connection_file, encoding="utf-8") as f:
-            connection_sett = json.load(f)
-        return connection_sett
+            return json.load(f)
+
+    def get_scontrol_job_field(self, jobid: int, field: str):
+        """Fetch and parse slurm job info."""
+        res = None
+        field += "="
+        what_size = len(field)
+        return_code, stdout, stderr, exception = run_cmd(
+            f"{self.args.scontrol} show job {jobid}"
+        )
+        if exception is not None:
+            print(exception)
+
+        if return_code:
+            raise WLMSpawnerError(
+                f"Unable to get job status. Jobid: {jobid}; stderr: {stderr}"
+            )
+        show_job = str(stdout).split()
+        for rec in show_job:
+            if rec[:what_size] == field:
+                res = rec[what_size:]
+        if res is None:
+            raise WLMSpawnerError(
+                f"Unable to get job field {field} for job {jobid}"
+            )
+        return res
 
     def _spawn_sge(self):
         # TODO
@@ -114,12 +135,12 @@ class WLMSpawner:
 
     def _spawn_slurm(self):
         # With -I don't wait inifinite time for allocation
-        salloc_cmd = f"salloc -I{DEFAULT_CMD_TIMEOUT} "
+        salloc_cmd = [
+            self.args.salloc,
+            f"-I{DEFAULT_CMD_TIMEOUT}",
+            *self.args.wlm_options.split(),
+        ]
 
-        # cut spaces and quotes
-        salloc_cmd += self.args.wlm_options.strip()[1:-1]
-
-        salloc_cmd = salloc_cmd.split()
         salloc_proc = subprocess.Popen(
             salloc_cmd,
             shell=False,
@@ -136,41 +157,51 @@ class WLMSpawner:
 
         # last element should be job number:
         try:
-            jobnum = int(salloc_line.split()[-1])
-        except ValueError:
+            jobid = int(salloc_line.split()[-1])
+        except ValueError as error:
             # didn't retur job number. Error.
             raise WLMSpawnerError(
                 f"Unable to get jobid. Error on allocation: {salloc_line}"
-            )
+            ) from error
 
         # delete job on exit
         atexit.register(
-            subprocess.Popen, f"scancel {jobnum}".split(), shell=False
+            subprocess.Popen,
+            [self.args.scancel, str(jobid)],
+            shell=False,
         )
 
         # check if job in RUNNING state
         job_state = "UNKNOWN"
         while job_state != "RUNNING":
-            job_state = get_scontrol_job_field(jobnum, "JobState")
+            job_state = self.get_scontrol_job_field(jobid, "JobState")
             if salloc_proc.poll():
                 # -I in salloc did it's job
                 raise WLMSpawnerError("Unable to get allocation.")
 
         # job in RUNNING state
         # get batch node
-        batch_host = get_scontrol_job_field(jobnum, "BatchHost")[:-2]
+        batch_host = self.get_scontrol_job_field(jobid, "BatchHost")[:-2]
 
         # Forward ports
-        ssh_forwarding = "ssh "
-        ssh_forwarding += f"-L {self.connection['shell_port']}:localhost:{self.connection['shell_port']} "
-        ssh_forwarding += f"-L {self.connection['iopub_port']}:localhost:{self.connection['iopub_port']} "
-        ssh_forwarding += f"-L {self.connection['stdin_port']}:localhost:{self.connection['stdin_port']} "
-        ssh_forwarding += f"-L {self.connection['control_port']}:localhost:{self.connection['control_port']} "
-        ssh_forwarding += f"-L {self.connection['hb_port']}:localhost:{self.connection['hb_port']} "
-        ssh_forwarding += f" -N {batch_host}"
+        ssh_forwarding = [
+            "ssh",
+            "-L",
+            f"{self.connection['shell_port']}:localhost:{self.connection['shell_port']}",
+            "-L",
+            f"{self.connection['iopub_port']}:localhost:{self.connection['iopub_port']}",
+            "-L",
+            f"{self.connection['stdin_port']}:localhost:{self.connection['stdin_port']}",
+            "-L",
+            f"{self.connection['control_port']}:localhost:{self.connection['control_port']}",
+            "-L",
+            f"{self.connection['hb_port']}:localhost:{self.connection['hb_port']}",
+            "-N",
+            batch_host,
+        ]
 
         ssh_proc = subprocess.Popen(
-            ssh_forwarding.split(),
+            ssh_forwarding,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=False,
@@ -217,7 +248,9 @@ class WLMSpawner:
         kernel_script = "set -e"
         kernel_script = "set -x"
         kernel_script += f"{env_commands}\n"
-        kernel_script += f"srun -N 1 -E -w {batch_host} {kernel_cmd}\n"
+        kernel_script += (
+            f"{self.args.srun} -N 1 -E -w {batch_host} {kernel_cmd}\n"
+        )
         _ = salloc_proc.communicate(kernel_script)
         salloc_proc.wait()
 
@@ -239,5 +272,6 @@ class WLMSpawner:
 
 
 def main():
+    """Main entrypoint."""
     wlm_spawner = WLMSpawner()
     wlm_spawner.spawn()
